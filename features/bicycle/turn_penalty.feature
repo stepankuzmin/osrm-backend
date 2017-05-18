@@ -10,7 +10,7 @@ Feature: Turn Penalties
         Given the profile file
         """
         require 'bicycle'
-        properties.weight_name = 'cyclability'
+        profile.weight_name = 'cyclability'
         """
 
         Given the node map
