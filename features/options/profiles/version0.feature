@@ -27,7 +27,7 @@ end
     Scenario: Out-bound API version
         Given the profile file
           """
-api_version = 2
+api_version = 3
           """
         And the node map
           """

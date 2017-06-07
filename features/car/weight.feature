@@ -65,7 +65,6 @@ Feature: Car - weights
     Scenario: Distance weights
         Given the profile file "car" extended with
         """
-        api_version = 1
         profile.weight_name = 'distance'
         """
 

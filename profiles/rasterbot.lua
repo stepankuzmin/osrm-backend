@@ -1,4 +1,4 @@
-api_version = 1
+api_version = 2
 -- Rasterbot profile
 
 profile = {

@@ -86,7 +86,6 @@ Feature: Traffic - speeds
     Scenario: Weighting based on speed file weights, ETA based on file durations
         Given the profile file "testbot" extended with
         """
-        api_version = 1
         profile.traffic_signal_penalty = 0
         profile.u_turn_penalty = 0
         profile.weight_precision = 2

@@ -1,4 +1,4 @@
-Feature: Profile API version 1
+Feature: Profile API version 2
 
     Background:
         Given a grid size of 100 meters
@@ -6,16 +6,16 @@ Feature: Profile API version 1
     Scenario: Basic profile function calls and property values
         Given the profile file
            """
-api_version = 1
+api_version = 2
 
 -- set profile properties
-properties.max_speed_for_map_matching      = 180/3.6
-properties.use_turn_restrictions           = true
-properties.continue_straight_at_waypoint   = true
-properties.weight_name                     = 'test_version1'
-properties.weight_precision                = 2
-
-assert(properties.max_turn_weight == 327.67)
+profile = {
+  max_speed_for_map_matching      = 180/3.6,
+  use_turn_restrictions           = true,
+  continue_straight_at_waypoint   = true,
+  weight_name                     = 'test_version2',
+  weight_precision                = 2
+}
 
 function node_function (node, result)
   print ('node_function ' .. node:id())

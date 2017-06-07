@@ -45,7 +45,7 @@ class Sol2ScriptingEnvironment final : public ScriptingEnvironment
 {
   public:
     static const constexpr int SUPPORTED_MIN_API_VERSION = 0;
-    static const constexpr int SUPPORTED_MAX_API_VERSION = 1;
+    static const constexpr int SUPPORTED_MAX_API_VERSION = 2;
 
     explicit Sol2ScriptingEnvironment(const std::string &file_name);
     ~Sol2ScriptingEnvironment() override = default;

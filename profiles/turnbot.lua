@@ -1,4 +1,4 @@
-api_version = 1
+api_version = 2
 
 -- Testbot, with turn penalty
 -- Used for testing turn penalties
