@@ -20,6 +20,9 @@
 #include "util/timing_util.hpp"
 
 #include <boost/assert.hpp>
+#include <boost/interprocess/sync/interprocess_upgradable_mutex.hpp>
+#include <boost/interprocess/sync/scoped_lock.hpp>
+#include <boost/interprocess/sync/sharable_lock.hpp>
 #include <boost/numeric/conversion/cast.hpp>
 
 #include <algorithm>
@@ -29,6 +32,9 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 namespace osrm
 {
@@ -319,6 +325,7 @@ void EdgeBasedGraphFactory::GenerateEdgeExpandedEdges(
     const std::string &turn_duration_penalties_filename,
     const std::string &turn_penalties_index_filename)
 {
+
     util::Log() << "Generating edge-expanded edges ";
 
     std::size_t node_based_edge_counter = 0;
@@ -368,181 +375,237 @@ void EdgeBasedGraphFactory::GenerateEdgeExpandedEdges(
         util::Percent progress(log, m_node_based_graph->GetNumberOfNodes());
         // going over all nodes (which form the center of an intersection), we compute all
         // possible turns along these intersections.
-        for (const auto node_at_center_of_intersection :
-             util::irange(0u, m_node_based_graph->GetNumberOfNodes()))
-        {
-            progress.PrintStatus(node_at_center_of_intersection);
+        std::mutex merge_mutex; // To control merging of all the data into the main data structures
+        std::uint64_t nodes_completed = 0;
 
-            const auto shape_result =
-                turn_analysis.ComputeIntersectionShapes(node_at_center_of_intersection);
+        tbb::parallel_for(
+            tbb::blocked_range<NodeID>(0, m_node_based_graph->GetNumberOfNodes()),
+            [&](const tbb::blocked_range<NodeID> &intersection_node_range) {
 
-            // all nodes in the graph are connected in both directions. We check all outgoing nodes
-            // to
-            // find the incoming edge. This is a larger search overhead, but the cost we need to pay
-            // to
-            // generate edges here is worth the additional search overhead.
-            //
-            // a -> b <-> c
-            //      |
-            //      v
-            //      d
-            //
-            // will have:
-            // a: b,rev=0
-            // b: a,rev=1 c,rev=0 d,rev=0
-            // c: b,rev=0
-            //
-            // From the flags alone, we cannot determine which nodes are connected to `b` by an
-            // outgoing
-            // edge. Therefore, we have to search all connected edges for edges entering `b`
-            for (const EdgeID outgoing_edge :
-                 m_node_based_graph->GetAdjacentEdgeRange(node_at_center_of_intersection))
-            {
-                const NodeID node_along_road_entering =
-                    m_node_based_graph->GetTarget(outgoing_edge);
+                // We capture the thread-local work in these objects, then flush
+                // them in a controlled manner at the end of the parallel range
+                std::vector<lookup::TurnIndexBlock> local_turn_indexes;
+                std::vector<EdgeBasedEdge> local_edges_list;
+                std::vector<TurnPenalty> local_turn_weight_penalties;
+                std::vector<TurnPenalty> local_turn_duration_penalties;
 
-                const auto incoming_edge = m_node_based_graph->FindEdge(
-                    node_along_road_entering, node_at_center_of_intersection);
+                std::vector<TurnData> local_turn_data_container;
 
-                if (m_node_based_graph->GetEdgeData(incoming_edge).reversed)
-                    continue;
-
-                ++node_based_edge_counter;
-
-                auto intersection_with_flags_and_angles =
-                    turn_analysis.GetIntersectionGenerator().TransformIntersectionShapeIntoView(
-                        node_along_road_entering,
-                        incoming_edge,
-                        shape_result.annotated_normalized_shape.normalized_shape,
-                        shape_result.intersection_shape,
-                        shape_result.annotated_normalized_shape.performed_merges);
-
-                auto intersection = turn_analysis.AssignTurnTypes(
-                    node_along_road_entering, incoming_edge, intersection_with_flags_and_angles);
-
-                OSRM_ASSERT(intersection.valid(), m_coordinates[node_at_center_of_intersection]);
-
-                intersection = turn_lane_handler.assignTurnLanes(
-                    node_along_road_entering, incoming_edge, std::move(intersection));
-
-                // the entry class depends on the turn, so we have to classify the interesction for
-                // every edge
-                const auto turn_classification = classifyIntersection(intersection);
-
-                const auto entry_class_id = [&](const util::guidance::EntryClass entry_class) {
-                    if (0 == entry_class_hash.count(entry_class))
-                    {
-                        const auto id = static_cast<std::uint16_t>(entry_class_hash.size());
-                        entry_class_hash[entry_class] = id;
-                        return id;
-                    }
-                    else
-                    {
-                        return entry_class_hash.find(entry_class)->second;
-                    }
-                }(turn_classification.first);
-
-                const auto bearing_class_id =
-                    [&](const util::guidance::BearingClass bearing_class) {
-                        if (0 == bearing_class_hash.count(bearing_class))
-                        {
-                            const auto id = static_cast<std::uint32_t>(bearing_class_hash.size());
-                            bearing_class_hash[bearing_class] = id;
-                            return id;
-                        }
-                        else
-                        {
-                            return bearing_class_hash.find(bearing_class)->second;
-                        }
-                    }(turn_classification.second);
-                bearing_class_by_node_based_node[node_at_center_of_intersection] = bearing_class_id;
-
-                for (const auto &turn : intersection)
+                for (auto node_at_center_of_intersection = intersection_node_range.begin(),
+                          range_end = intersection_node_range.end();
+                     node_at_center_of_intersection != range_end;
+                     ++node_at_center_of_intersection)
                 {
-                    // only keep valid turns
-                    if (!turn.entry_allowed)
-                        continue;
+                    // progress.PrintStatus(node_at_center_of_intersection);
 
-                    // only add an edge if turn is not prohibited
-                    const EdgeData &edge_data1 = m_node_based_graph->GetEdgeData(incoming_edge);
-                    const EdgeData &edge_data2 = m_node_based_graph->GetEdgeData(turn.eid);
+                    const auto shape_result =
+                        turn_analysis.ComputeIntersectionShapes(node_at_center_of_intersection);
 
-                    BOOST_ASSERT(edge_data1.edge_id != edge_data2.edge_id);
-                    BOOST_ASSERT(!edge_data1.reversed);
-                    BOOST_ASSERT(!edge_data2.reversed);
+                    // all nodes in the graph are connected in both directions. We check all
+                    // outgoing nodes
+                    // to
+                    // find the incoming edge. This is a larger search overhead, but the cost we
+                    // need to pay
+                    // to
+                    // generate edges here is worth the additional search overhead.
+                    //
+                    // a -> b <-> c
+                    //      |
+                    //      v
+                    //      d
+                    //
+                    // will have:
+                    // a: b,rev=0
+                    // b: a,rev=1 c,rev=0 d,rev=0
+                    // c: b,rev=0
+                    //
+                    // From the flags alone, we cannot determine which nodes are connected to `b` by
+                    // an
+                    // outgoing
+                    // edge. Therefore, we have to search all connected edges for edges entering `b`
+                    for (const EdgeID outgoing_edge :
+                         m_node_based_graph->GetAdjacentEdgeRange(node_at_center_of_intersection))
+                    {
+                        const NodeID node_along_road_entering =
+                            m_node_based_graph->GetTarget(outgoing_edge);
 
-                    // the following is the core of the loop.
-                    turn_data_container.push_back(
-                        turn.instruction,
-                        turn.lane_data_id,
-                        entry_class_id,
-                        util::guidance::TurnBearing(intersection[0].bearing),
-                        util::guidance::TurnBearing(turn.bearing));
+                        const auto incoming_edge = m_node_based_graph->FindEdge(
+                            node_along_road_entering, node_at_center_of_intersection);
 
-                    // compute weight and duration penalties
-                    auto is_traffic_light = m_traffic_lights.count(node_at_center_of_intersection);
-                    ExtractionTurn extracted_turn(turn, is_traffic_light);
-                    extracted_turn.source_restricted = edge_data1.restricted;
-                    extracted_turn.target_restricted = edge_data2.restricted;
-                    scripting_environment.ProcessTurn(extracted_turn);
+                        if (m_node_based_graph->GetEdgeData(incoming_edge).reversed)
+                            continue;
 
-                    // turn penalties are limited to [-2^15, 2^15) which roughly
-                    // translates to 54 minutes and fits signed 16bit deci-seconds
-                    auto weight_penalty =
-                        boost::numeric_cast<TurnPenalty>(extracted_turn.weight * weight_multiplier);
-                    auto duration_penalty =
-                        boost::numeric_cast<TurnPenalty>(extracted_turn.duration * 10.);
+                        ++node_based_edge_counter;
 
-                    BOOST_ASSERT(SPECIAL_NODEID != edge_data1.edge_id);
-                    BOOST_ASSERT(SPECIAL_NODEID != edge_data2.edge_id);
+                        auto intersection_with_flags_and_angles =
+                            turn_analysis.GetIntersectionGenerator()
+                                .TransformIntersectionShapeIntoView(
+                                    node_along_road_entering,
+                                    incoming_edge,
+                                    shape_result.annotated_normalized_shape.normalized_shape,
+                                    shape_result.intersection_shape,
+                                    shape_result.annotated_normalized_shape.performed_merges);
+
+                        auto intersection =
+                            turn_analysis.AssignTurnTypes(node_along_road_entering,
+                                                          incoming_edge,
+                                                          intersection_with_flags_and_angles);
+
+                        OSRM_ASSERT(intersection.valid(),
+                                    m_coordinates[node_at_center_of_intersection]);
+
+                        intersection = turn_lane_handler.assignTurnLanes(
+                            node_along_road_entering, incoming_edge, std::move(intersection));
+
+                        // the entry class depends on the turn, so we have to classify the
+                        // interesction for
+                        // every edge
+                        const auto turn_classification = classifyIntersection(intersection);
+
+                        const auto entry_class_id =
+                            entry_class_hash.ConcurrentFindOrAdd(turn_classification.first);
+
+                        const auto bearing_class_id =
+                            bearing_class_hash.ConcurrentFindOrAdd(turn_classification.second);
+
+                        // Note - this is strictly speaking not thread safe, but we know we
+                        // should never be touching the same element twice, so we should
+                        // be fine.
+                        bearing_class_by_node_based_node[node_at_center_of_intersection] =
+                            bearing_class_id;
+
+                        for (const auto &turn : intersection)
+                        {
+                            // only keep valid turns
+                            if (!turn.entry_allowed)
+                                continue;
+
+                            // only add an edge if turn is not prohibited
+                            const EdgeData &edge_data1 =
+                                m_node_based_graph->GetEdgeData(incoming_edge);
+                            const EdgeData &edge_data2 = m_node_based_graph->GetEdgeData(turn.eid);
+
+                            BOOST_ASSERT(edge_data1.edge_id != edge_data2.edge_id);
+                            BOOST_ASSERT(!edge_data1.reversed);
+                            BOOST_ASSERT(!edge_data2.reversed);
+
+                            // the following is the core of the loop.
+                            local_turn_data_container.push_back(
+                                {turn.instruction,
+                                 turn.lane_data_id,
+                                 entry_class_id,
+                                 util::guidance::TurnBearing(intersection[0].bearing),
+                                 util::guidance::TurnBearing(turn.bearing)});
+
+                            // compute weight and duration penalties
+                            auto is_traffic_light =
+                                m_traffic_lights.count(node_at_center_of_intersection);
+                            ExtractionTurn extracted_turn(turn, is_traffic_light);
+                            extracted_turn.source_restricted = edge_data1.restricted;
+                            extracted_turn.target_restricted = edge_data2.restricted;
+                            scripting_environment.ProcessTurn(extracted_turn);
+
+                            // turn penalties are limited to [-2^15, 2^15) which roughly
+                            // translates to 54 minutes and fits signed 16bit deci-seconds
+                            auto weight_penalty = boost::numeric_cast<TurnPenalty>(
+                                extracted_turn.weight * weight_multiplier);
+                            auto duration_penalty =
+                                boost::numeric_cast<TurnPenalty>(extracted_turn.duration * 10.);
+
+                            BOOST_ASSERT(SPECIAL_NODEID != edge_data1.edge_id);
+                            BOOST_ASSERT(SPECIAL_NODEID != edge_data2.edge_id);
+
+                            // auto turn_id = m_edge_based_edge_list.size();
+                            auto weight =
+                                boost::numeric_cast<EdgeWeight>(edge_data1.weight + weight_penalty);
+                            auto duration = boost::numeric_cast<EdgeWeight>(edge_data1.duration +
+                                                                            duration_penalty);
+                            local_edges_list.emplace_back(
+                                edge_data1.edge_id,
+                                edge_data2.edge_id,
+                                SPECIAL_NODEID, // This will be updated once the main loop
+                                                // completes!
+                                weight,
+                                duration,
+                                true,
+                                false);
+
+                            BOOST_ASSERT(local_turn_weight_penalties.size() ==
+                                         local_edges_list.size() - 1);
+                            local_turn_weight_penalties.push_back(weight_penalty);
+                            BOOST_ASSERT(local_turn_duration_penalties.size() ==
+                                         local_edges_list.size() - 1);
+                            local_turn_duration_penalties.push_back(duration_penalty);
+
+                            // We write out the mapping between the edge-expanded edges and the
+                            // original nodes. Since each edge represents a possible maneuver,
+                            // external
+                            // programs can use this to quickly perform updates to edge weights in
+                            // order
+                            // to penalize certain turns.
+
+                            // If this edge is 'trivial' -- where the compressed edge corresponds
+                            // exactly to an original OSM segment -- we can pull the turn's
+                            // preceding
+                            // node ID directly with `node_along_road_entering`; otherwise, we need
+                            // to
+                            // look up the node immediately preceding the turn from the compressed
+                            // edge
+                            // container.
+                            const bool isTrivial =
+                                m_compressed_edge_container.IsTrivial(incoming_edge);
+
+                            const auto &from_node =
+                                isTrivial ? node_along_road_entering
+                                          : m_compressed_edge_container.GetLastEdgeSourceID(
+                                                incoming_edge);
+                            const auto &via_node =
+                                m_compressed_edge_container.GetLastEdgeTargetID(incoming_edge);
+                            const auto &to_node =
+                                m_compressed_edge_container.GetFirstEdgeTargetID(turn.eid);
+
+                            local_turn_indexes.push_back({from_node, via_node, to_node});
+                        }
+                    }
+                }
+                {
+                    // Merge the data in a serial fashion into the larger arrays/files
+                    // to keep everything ordered
+                    std::lock_guard<std::mutex> lock(merge_mutex);
+
+                    nodes_completed +=
+                        intersection_node_range.end() - intersection_node_range.begin();
+
+                    progress.PrintStatus(nodes_completed);
 
                     // NOTE: potential overflow here if we hit 2^32 routable edges
                     BOOST_ASSERT(m_edge_based_edge_list.size() <=
                                  std::numeric_limits<NodeID>::max());
-                    auto turn_id = m_edge_based_edge_list.size();
-                    auto weight =
-                        boost::numeric_cast<EdgeWeight>(edge_data1.weight + weight_penalty);
-                    auto duration =
-                        boost::numeric_cast<EdgeWeight>(edge_data1.duration + duration_penalty);
-                    m_edge_based_edge_list.emplace_back(edge_data1.edge_id,
-                                                        edge_data2.edge_id,
-                                                        turn_id,
-                                                        weight,
-                                                        duration,
-                                                        true,
-                                                        false);
+                    m_edge_based_edge_list.append(local_edges_list.begin(), local_edges_list.end());
 
-                    BOOST_ASSERT(turn_weight_penalties.size() == turn_id);
-                    turn_weight_penalties.push_back(weight_penalty);
-                    BOOST_ASSERT(turn_duration_penalties.size() == turn_id);
-                    turn_duration_penalties.push_back(duration_penalty);
+                    turn_weight_penalties.insert(turn_weight_penalties.end(),
+                                                 local_turn_weight_penalties.begin(),
+                                                 local_turn_weight_penalties.end());
+                    turn_duration_penalties.insert(turn_duration_penalties.end(),
+                                                   local_turn_duration_penalties.begin(),
+                                                   local_turn_duration_penalties.end());
+                    turn_data_container.append(local_turn_data_container);
 
-                    // We write out the mapping between the edge-expanded edges and the
-                    // original nodes. Since each edge represents a possible maneuver, external
-                    // programs can use this to quickly perform updates to edge weights in order
-                    // to penalize certain turns.
-
-                    // If this edge is 'trivial' -- where the compressed edge corresponds
-                    // exactly to an original OSM segment -- we can pull the turn's preceding
-                    // node ID directly with `node_along_road_entering`; otherwise, we need to
-                    // look up the node immediately preceding the turn from the compressed edge
-                    // container.
-                    const bool isTrivial = m_compressed_edge_container.IsTrivial(incoming_edge);
-
-                    const auto &from_node =
-                        isTrivial ? node_along_road_entering
-                                  : m_compressed_edge_container.GetLastEdgeSourceID(incoming_edge);
-                    const auto &via_node =
-                        m_compressed_edge_container.GetLastEdgeTargetID(incoming_edge);
-                    const auto &to_node =
-                        m_compressed_edge_container.GetFirstEdgeTargetID(turn.eid);
-
-                    lookup::TurnIndexBlock turn_index_block = {from_node, via_node, to_node};
-
-                    turn_penalties_index_file.WriteOne(turn_index_block);
+                    turn_penalties_index_file.WriteFrom(local_turn_indexes.data(),
+                                                        local_turn_indexes.size());
                 }
-            }
-        }
+            });
+
+        util::Log() << "Reunmbering turns";
+        // Now, update the turn_id property on every EdgeBasedEdge - it will equal the
+        // position in the m_edge_based_edge_list array for each object.
+        tbb::parallel_for(tbb::blocked_range<NodeID>(0, m_edge_based_edge_list.size()),
+                          [this](const tbb::blocked_range<NodeID> &range) {
+                              for (auto x = range.begin(), end = range.end(); x != end; ++x)
+                              {
+                                  m_edge_based_edge_list[x].data.turn_id = x;
+                              }
+                          });
     }
 
     // write weight penalties per turn
@@ -559,17 +622,17 @@ void EdgeBasedGraphFactory::GenerateEdgeExpandedEdges(
         storage::serialization::write(writer, turn_duration_penalties);
     }
 
-    util::Log() << "Created " << entry_class_hash.size() << " entry classes and "
-                << bearing_class_hash.size() << " Bearing Classes";
+    util::Log() << "Created " << entry_class_hash.data.size() << " entry classes and "
+                << bearing_class_hash.data.size() << " Bearing Classes";
 
     util::Log() << "Writing Turn Lane Data to File...";
     {
         storage::io::FileWriter writer(turn_lane_data_filename,
                                        storage::io::FileWriter::GenerateFingerprint);
 
-        std::vector<util::guidance::LaneTupleIdPair> lane_data(lane_data_map.size());
+        std::vector<util::guidance::LaneTupleIdPair> lane_data(lane_data_map.data.size());
         // extract lane data sorted by ID
-        for (auto itr : lane_data_map)
+        for (auto itr : lane_data_map.data)
             lane_data[itr.second] = itr.first;
 
         storage::serialization::write(writer, lane_data);
@@ -591,8 +654,8 @@ void EdgeBasedGraphFactory::GenerateEdgeExpandedEdges(
 
 std::vector<util::guidance::BearingClass> EdgeBasedGraphFactory::GetBearingClasses() const
 {
-    std::vector<util::guidance::BearingClass> result(bearing_class_hash.size());
-    for (const auto &pair : bearing_class_hash)
+    std::vector<util::guidance::BearingClass> result(bearing_class_hash.data.size());
+    for (const auto &pair : bearing_class_hash.data)
     {
         BOOST_ASSERT(pair.second < result.size());
         result[pair.second] = pair.first;
@@ -612,8 +675,8 @@ std::vector<BearingClassID> &EdgeBasedGraphFactory::GetBearingClassIds()
 
 std::vector<util::guidance::EntryClass> EdgeBasedGraphFactory::GetEntryClasses() const
 {
-    std::vector<util::guidance::EntryClass> result(entry_class_hash.size());
-    for (const auto &pair : entry_class_hash)
+    std::vector<util::guidance::EntryClass> result(entry_class_hash.data.size());
+    for (const auto &pair : entry_class_hash.data)
     {
         BOOST_ASSERT(pair.second < result.size());
         result[pair.second] = pair.first;
