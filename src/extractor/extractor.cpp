@@ -33,12 +33,14 @@
 
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
+#include <boost/iterator/function_input_iterator.hpp>
 #include <boost/optional/optional.hpp>
 #include <boost/scope_exit.hpp>
 
 #include <osmium/io/any_input.hpp>
 
-#include <tbb/concurrent_vector.h>
+#include <tbb/enumerable_thread_specific.h>
+#include <tbb/parallel_for_each.h>
 #include <tbb/task_scheduler_init.h>
 
 #include <cstdlib>
@@ -252,11 +254,6 @@ std::vector<TurnRestriction> Extractor::ParseOSMData(ScriptingEnvironment &scrip
 
     timestamp_file.WriteFrom(timestamp.c_str(), timestamp.length());
 
-    // initialize vectors holding parsed objects
-    tbb::concurrent_vector<std::pair<std::size_t, ExtractionNode>> resulting_nodes;
-    tbb::concurrent_vector<std::pair<std::size_t, ExtractionWay>> resulting_ways;
-    tbb::concurrent_vector<boost::optional<InputRestrictionContainer>> resulting_restrictions;
-
     std::vector<std::string> restrictions = scripting_environment.GetRestrictions();
     // setup restriction parser
     const RestrictionParser restriction_parser(
@@ -264,46 +261,53 @@ std::vector<TurnRestriction> Extractor::ParseOSMData(ScriptingEnvironment &scrip
         config.parse_conditionals,
         restrictions);
 
-    // create a vector of iterators into the buffer
-    for (std::vector<osmium::memory::Buffer::const_iterator> osm_elements;
-         const osmium::memory::Buffer buffer = reader.read();
-         osm_elements.clear())
+    std::mutex process_mutex;
+
+    constexpr std::size_t BATCH_SIZE = 32;
+    std::vector<osmium::memory::Buffer> batch(BATCH_SIZE);
+    while (!reader.eof())
     {
-        for (auto iter = std::begin(buffer), end = std::end(buffer); iter != end; ++iter)
+        std::size_t batch_idx = 0;
+        while (batch_idx < batch.size() && (batch[batch_idx] = reader.read()))
         {
-            osm_elements.push_back(iter);
+            batch_idx++;
         }
 
-        // clear resulting vectors
-        resulting_nodes.clear();
-        resulting_ways.clear();
-        resulting_restrictions.clear();
+        tbb::parallel_for_each(
+            batch.begin(), batch.begin() + batch_idx, [&](const osmium::memory::Buffer &buffer) {
+                std::vector<std::pair<const osmium::Node &, ExtractionNode>> resulting_nodes;
+                std::vector<std::pair<const osmium::Way &, ExtractionWay>> resulting_ways;
+                std::vector<boost::optional<InputRestrictionContainer>> resulting_restrictions;
 
-        scripting_environment.ProcessElements(osm_elements,
-                                              restriction_parser,
-                                              resulting_nodes,
-                                              resulting_ways,
-                                              resulting_restrictions);
+                scripting_environment.ProcessElements(buffer,
+                                                      restriction_parser,
+                                                      resulting_nodes,
+                                                      resulting_ways,
+                                                      resulting_restrictions);
 
-        number_of_nodes += resulting_nodes.size();
-        // put parsed objects thru extractor callbacks
-        for (const auto &result : resulting_nodes)
-        {
-            extractor_callbacks->ProcessNode(
-                static_cast<const osmium::Node &>(*(osm_elements[result.first])), result.second);
-        }
-        number_of_ways += resulting_ways.size();
-        for (const auto &result : resulting_ways)
-        {
-            extractor_callbacks->ProcessWay(
-                static_cast<const osmium::Way &>(*(osm_elements[result.first])), result.second);
-        }
-        number_of_relations += resulting_restrictions.size();
-        for (const auto &result : resulting_restrictions)
-        {
-            extractor_callbacks->ProcessRestriction(result);
-        }
+                // serial insertion
+                {
+                    std::lock_guard<std::mutex> process_lock(process_mutex);
+                    number_of_nodes += resulting_nodes.size();
+                    // put parsed objects thru extractor callbacks
+                    for (const auto &result : resulting_nodes)
+                    {
+                        extractor_callbacks->ProcessNode(result.first, result.second);
+                    }
+                    number_of_ways += resulting_ways.size();
+                    for (const auto &result : resulting_ways)
+                    {
+                        extractor_callbacks->ProcessWay(result.first, result.second);
+                    }
+                    number_of_relations += resulting_restrictions.size();
+                    for (const auto &result : resulting_restrictions)
+                    {
+                        extractor_callbacks->ProcessRestriction(result);
+                    }
+                }
+            });
     }
+
     TIMER_STOP(parsing);
     util::Log() << "Parsing finished after " << TIMER_SEC(parsing) << " seconds";
 
